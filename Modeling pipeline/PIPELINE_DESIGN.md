@@ -326,26 +326,48 @@ Insight:
 - Non-linear models needed
 ```
 
-**Design Decision:** Tree-Based Ensemble Models
+**Design Decision:** Multi-Model Ensemble Approach
 
 **Selected Models:**
-1. **XGBoost** (primary choice)
+
+1. **Ridge (Linear Baseline)**
+   - Weak linear correlation baseline (0.121 max)
+   - Quick training, interpretable coefficients
+   - Used to demonstrate need for non-linear models
+
+2. **Random Forest (Tree Ensemble)**
+   - Handles non-linear relationships
+   - Parallel tree voting reduces variance
+   - Good for mixed feature types
+   - Fast on CPU
+
+3. **Gradient Boosting (Sequential Boosting)**
+   - Sequential tree building improves residuals
+   - Better feature interactions than RF
+   - Slower but often more accurate
+   - Sensitive to hyperparameters
+
+4. **XGBoost (Optimized Boosting)** ⭐ Primary
+   - Gradient boosting with regularization
    - Handles non-linear relationships
    - Naturally handles mixed feature types
    - Robust to outliers via gradient boosting
-   - Hyperparameters tuned for taxi domain
+   - Fast with `tree_method='hist'`
 
-2. **Random Forest** (baseline)
-   - Simple ensemble, low variance
-   - Good for comparison
+**Model Comparison Logic:**
+```
+R² scores compared on validation set:
+- Highest R² = best model (primary metric)
+- Ridge typically lowest (linear model weakness)
+- Tree models typically higher (capture non-linearity)
+- XGBoost often best due to regularization
+```
 
-3. **Gradient Boosting** (secondary)
-   - Similar to XGBoost, slower but interpretable
-
-**Why NOT Linear Regression:**
-- Correlations too weak (0.121 max) for linear model
-- Interaction effects likely (hour × vendor, location × distance)
-- Tree models capture these non-linearities
+**Why Tree Models Over Linear:**
+- Distance correlation 0.121 → pure linear R² ≈ 0.015
+- Actual R² with features ≈ 0.3-0.4 → interaction effects exist
+- Hour × location, vendor × distance interactions matter
+- Non-linear geographic patterns (Manhattan congestion)
 
 ---
 
@@ -447,15 +469,36 @@ Model Training/Prediction
    - Less sensitive to outliers than RMSE
    - Useful for communicating error to stakeholders
 
+### Numerical Stability:
+
+**Challenge:** Reverse log transformation can overflow on extreme predictions
+```python
+# Problem: exp(extreme_value) overflows to inf
+y_pred_original = np.expm1(y_pred_log)  # Can overflow!
+
+# Solution: Clip predictions to training range
+log_mean = y_train_log.mean()
+log_std = y_train_log.std()
+min_bound = log_mean - 3 * log_std
+max_bound = log_mean + 3 * log_std
+y_pred_clipped = np.clip(y_pred_log, min_bound, max_bound)
+
+# Then safe to transform
+y_pred_original = np.expm1(y_pred_clipped)
+```
+
 ### Evaluation Protocol:
 
 ```python
 # Evaluate on log-transformed scale
 rmse_log = sqrt(mean_squared_error(y_train_log, y_pred_log))
 
+# Clip predictions to prevent numerical overflow
+y_pred_clipped = clip(y_pred_log, bounds)
+
 # Reverse transformation for interpretation
 y_true_original = exp(y_true_log) - 1
-y_pred_original = exp(y_pred_log) - 1
+y_pred_original = exp(y_pred_clipped) - 1
 
 # Report in original scale (seconds/minutes)
 rmse_seconds = sqrt(mean_squared_error(y_true_original, y_pred_original))
@@ -547,16 +590,34 @@ Main script: `modeling_pipeline.py`
 
 Functions:
 - `load_data()` - Load train/val/test CSVs
-- `calculate_haversine_distance()` - Geographic distance
-- `engineer_features()` - Temporal + distance features
-- `create_preprocessing_pipeline()` - ColumnTransformer setup
-- `create_models()` - Initialize XGBoost, RF, GB
-- `train_model()` - Fit preprocessor (train only), train model
-- `evaluate_model()` - Compute metrics, reverse transformations
-- `main()` - Execute complete pipeline
+- `calculate_haversine_distance()` - Geographic distance calculation
+- `engineer_features()` - Temporal + distance feature engineering
+- `create_preprocessing_pipeline()` - ColumnTransformer setup with branched transformers
+- `create_models()` - Initialize Ridge, RandomForest, GradientBoosting, XGBoost
+- `train_model()` - Fit preprocessor (train data only), train model, generate predictions
+- `evaluate_model()` - Compute metrics with numerical stability, reverse transformations, report results
+- `main()` - Execute complete pipeline: load → engineer → preprocess → train all models → evaluate → compare → test
+
+### Key Implementation Details:
+
+1. **evaluate_model()** accepts optional `y_train_log` parameter for clipping bounds
+   - Clips predictions to prevent numerical overflow in expm1 transformation
+   - Uses training distribution statistics (mean ± 3*std)
+   - Prevents unrealistic predictions from corrupting metrics
+
+2. **create_models()** returns 4-model ensemble:
+   - Ridge: Linear baseline (typically worst)
+   - RandomForest: Tree ensemble (medium performance)
+   - GradientBoosting: Sequential boosting (good performance)
+   - XGBoost: Optimized boosting (often best)
+
+3. **main()** trains each model independently:
+   - Fresh preprocessor instance for each model
+   - Each model compared fairly with same preprocessing
+   - Best model selected by highest R² on validation set
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-04-18  
-**Status:** Ready for Production Deployment
+**Document Version:** 2.0  
+**Last Updated:** 2026-04-20  
+**Status:** Updated with all models and numerical stability fixes

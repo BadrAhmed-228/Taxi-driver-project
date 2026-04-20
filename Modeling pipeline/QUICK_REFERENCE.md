@@ -20,7 +20,7 @@ python modeling_pipeline.py
 | **RobustScaler Distance** | Skewed (std 4.42 km), 9.64% outliers | `RobustScaler()` (not StandardScaler) |
 | **OneHot Hour/Day** | 33% hourly variation, 12% daily variation | `OneHotEncoder(drop='first')` |
 | **Keep Outliers** | 50,939 duration outliers are valid (stored rides) | Don't remove; let RobustScaler handle |
-| **Tree Models** | Weak correlations (0.121 max), non-linear | XGBoost, RandomForest, GradientBoosting |
+| **Tree Models** | Weak correlations (0.121 max), non-linear | Ridge (baseline), RandomForest, GradientBoosting, XGBoost |
 | **Feature Engineering** | Multiple patterns (temporal, distance, vendor) | Extract hour, day_of_week, distance_km, flags |
 | **Data Leakage Prevention** | Critical for honest evaluation | Fit preprocessor ONLY on training data |
 
@@ -83,7 +83,7 @@ store_and_fwd_flag, trip_duration (target)
 ==================================================================
 FEATURE ENGINEERING
 ==================================================================
-Engineered features added. Train shape: (1000000, 21)
+Engineered features added. Train shape: (1000000, 18)
 
 ==================================================================
 CREATING PREPROCESSING PIPELINE
@@ -93,28 +93,42 @@ Categorical/Binary features (5): [...]
 One-hot features (3): [...]
 
 ==================================================================
-Training XGBoost
+Training Ridge
 ==================================================================
 Processed training shape: (1000000, N_features)
 Processed validation shape: (229319, N_features)
-Training XGBoost...
+Training Ridge...
 
-Validation Set Metrics (Log Scale):
-  RMSE (log): 0.XX
-  MAE (log):  0.XX
+Validation Set Metrics:
   R² Score:   0.XXX
+  RMSE (log): 0.XXXX
+  MAE (log):  0.XXXX
+  RMSE (seconds): XXXX.XX (XX.XX minutes)
+  MAE (seconds):  XXXX.XX (XX.XX minutes)
 
-Validation Set Metrics (Original Scale - Seconds):
-  RMSE: XXXX.XX seconds (XX.XX minutes)
-  MAE:  XXXX.XX seconds (XX.XX minutes)
+==================================================================
+Training RandomForest
+==================================================================
+...
+
+==================================================================
+Training GradientBoosting
+==================================================================
+...
+
+==================================================================
+Training XGBoost
+==================================================================
+...
 
 ==================================================================
 MODEL COMPARISON - VALIDATION SET
 ==================================================================
-             R² Score  RMSE (log)  MAE (minutes)
-XGBoost         0.XX      0.XX        XX.XX
-RandomForest    0.XX      0.XX        XX.XX
-GradientBoosting 0.XX     0.XX        XX.XX
+                  R² Score  RMSE (log)  MAE (minutes)
+Ridge               0.XXX      0.XXXX        XX.XX
+RandomForest        0.XXX      0.XXXX        XX.XX
+GradientBoosting    0.XXX      0.XXXX        XX.XX
+XGBoost             0.XXX      0.XXXX        XX.XX
 
 🏆 Best Model: XGBoost (R² = 0.XXX)
 

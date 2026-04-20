@@ -14,8 +14,8 @@ A **complete, production-level ML modeling pipeline** for NYC Taxi Trip Duration
 - Loads train/val/test data
 - Engineers features based on EDA insights
 - Creates sklearn preprocessing pipeline
-- Trains 3 models (XGBoost, RandomForest, GradientBoosting)
-- Evaluates models with proper metrics
+- Trains 4 models (Ridge baseline, RandomForest, GradientBoosting, XGBoost)
+- Evaluates models with proper metrics and numerical stability
 - Selects best model
 - Makes test set predictions
 
@@ -156,7 +156,7 @@ ColumnTransformer
     ├── Categorical Path → OrdinalEncoder
     └── OneHot Path → OneHotEncoder
     ↓ (40 features, scaled/encoded)
-Model Training (XGBoost, RandomForest, GradientBoosting)
+Model Training (Ridge, RandomForest, GradientBoosting, XGBoost)
     ↓
 Model Selection (best R² on validation)
     ↓
@@ -177,6 +177,7 @@ Based on EDA findings:
 | **MAE** | 3-4 minutes | Average prediction error ±3-4 minutes |
 | **RMSE** | 5-8 minutes | Typical error accounting for outliers |
 | **Training vs Validation** | Similar | No overfitting (weak signals limit it) |
+| **Model Ranking** | Tree > Ridge | Tree-based models typically outperform Ridge baseline |
 
 **Why performance is limited:** Weak feature correlations (max 0.121) + missing variables (traffic, weather, events)
 
@@ -209,14 +210,15 @@ See "Troubleshooting" section in **QUICK_REFERENCE.md**
 
 ## ✅ Quality Checklist
 
-- ✓ All preprocessing decisions based on EDA findings
-- ✓ No data leakage (train-only fitting)
-- ✓ Proper train/validation split
-- ✓ Three models compared
-- ✓ Metrics reported in interpretable units
-- ✓ Code is modular and well-documented
-- ✓ Handles edge cases (zero distance, rare passengers, imbalanced flags)
-- ✓ Production-ready error handling
+✓ All preprocessing decisions based on EDA findings
+✓ No data leakage (train-only fitting)
+✓ Proper train/validation split
+✓ Four models compared (Ridge baseline + 3 tree-based)
+✓ Metrics reported in interpretable units
+✓ Numerical stability (clipping prevents overflow)
+✓ Code is modular and well-documented
+✓ Handles edge cases (zero distance, rare passengers, imbalanced flags)
+✓ Production-ready error handling
 
 ---
 
@@ -316,6 +318,7 @@ Check EDA: max correlation is 0.121 (very weak). This is a data limitation, not 
 ## 📄 Version Info
 
 - **Created:** 2026-04-18
+- **Updated:** 2026-04-20 (Added Ridge baseline, numerical stability fixes, 4-model ensemble)
 - **Based on:** EDA Report (intensive analysis, 1.45M records)
 - **Status:** Production-Ready ✓
 - **Python Version:** 3.8+

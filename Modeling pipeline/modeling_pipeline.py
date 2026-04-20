@@ -25,6 +25,7 @@ from sklearn.preprocessing import (
 from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 import xgboost as xgb
@@ -189,34 +190,40 @@ def create_models():
     Create models based on EDA findings.
 
     EDA Insight: Weak linear correlations (max 0.121) suggest tree-based
-    models are more appropriate than linear regression.
+    models are more appropriate than linear regression. Including both linear
+    and tree-based approaches for comparison.
     """
 
     models = {
-        'XGBoost': xgb.XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            n_jobs=-1,
-            verbose=0
+        'Ridge': Ridge(
+            alpha=1.0,
+            random_state=42
         ),
         'RandomForest': RandomForestRegressor(
-            n_estimators=100,
-            max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=5,
+            n_estimators=10,
+            max_depth=10,
+            min_samples_split=100,
+            min_samples_leaf=50,
             random_state=42,
             n_jobs=-1
         ),
         'GradientBoosting': GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=5,
+            n_estimators=15,
             learning_rate=0.1,
-            subsample=0.8,
-            random_state=42
+            max_depth=4,
+            min_samples_split=100,
+            min_samples_leaf=50,
+            random_state=42,
+            subsample=0.5
+        ),
+        'XGBoost': xgb.XGBRegressor(
+            n_estimators=15,
+            learning_rate=0.1,
+            max_depth=4,
+            min_child_weight=50,
+            random_state=42,
+            n_jobs=-1,
+            tree_method='hist'
         )
     }
 
@@ -261,7 +268,7 @@ def train_model(X_train, y_train, X_val, y_val, preprocessor, model_name, model)
 # 6. EVALUATION METRICS
 # ============================================================================
 
-def evaluate_model(y_true, y_pred, split_name='Validation'):
+def evaluate_model(y_true, y_pred, split_name='Validation', y_train_log=None):
     """
     Evaluate model performance.
 
@@ -269,28 +276,51 @@ def evaluate_model(y_true, y_pred, split_name='Validation'):
     - RMSE: Penalizes large errors (important for trip duration)
     - MAE: Interpretable error in minutes
     - R²: Proportion of variance explained
+
+    Parameters:
+    -----------
+    y_true : array-like
+        True target values (in log space)
+    y_pred : array-like
+        Predicted values (in log space)
+    split_name : str
+        Name of the split (e.g., 'Validation', 'Training')
+    y_train_log : array-like, optional
+        Training log values for calculating bounds for clipping
     """
 
+    # Clip predictions to reasonable bounds to prevent numerical overflow
+    if y_train_log is not None:
+        log_mean = y_train_log.mean()
+        log_std = y_train_log.std()
+        min_bound = log_mean - 3 * log_std
+        max_bound = log_mean + 3 * log_std
+    else:
+        log_mean = y_true.mean()
+        log_std = y_true.std()
+        min_bound = log_mean - 3 * log_std
+        max_bound = log_mean + 3 * log_std
+
+    y_pred_clipped = np.clip(y_pred, min_bound, max_bound)
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred_clipped))
+    mae = mean_absolute_error(y_true, y_pred_clipped)
+    r2 = r2_score(y_true, y_pred_clipped)
+
     # IMPORTANT: Reverse log transformation for interpretability
-    y_true_original = np.exp(y_true) - 1  # Reverse log transform
-    y_pred_original = np.exp(y_pred) - 1
+    # Use clipped predictions to prevent numerical overflow
+    y_true_original = np.expm1(y_true)  # Stable reverse of log1p
+    y_pred_original = np.expm1(y_pred_clipped)
 
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-
-    # In original scale (seconds)
     rmse_original = np.sqrt(mean_squared_error(y_true_original, y_pred_original))
     mae_original = mean_absolute_error(y_true_original, y_pred_original)
 
-    print(f"\n{split_name} Set Metrics (Log Scale):")
+    print(f"\n{split_name} Set Metrics:")
+    print(f"  R² Score:   {r2:.4f}")
     print(f"  RMSE (log): {rmse:.4f}")
     print(f"  MAE (log):  {mae:.4f}")
-    print(f"  R² Score:   {r2:.4f}")
-
-    print(f"\n{split_name} Set Metrics (Original Scale - Seconds):")
-    print(f"  RMSE: {rmse_original:.2f} seconds ({rmse_original/60:.2f} minutes)")
-    print(f"  MAE:  {mae_original:.2f} seconds ({mae_original/60:.2f} minutes)")
+    print(f"  RMSE (seconds): {rmse_original:.2f} ({rmse_original/60:.2f} minutes)")
+    print(f"  MAE (seconds):  {mae_original:.2f} ({mae_original/60:.2f} minutes)")
 
     return {
         'rmse_log': rmse,
@@ -373,9 +403,9 @@ def main():
             preprocessor_copy, model_name, model
         )
 
-        # Evaluate
-        train_metrics = evaluate_model(y_train_log, y_train_pred, 'Training')
-        val_metrics = evaluate_model(y_val_log, y_val_pred, 'Validation')
+        # Evaluate (pass y_train_log for proper clipping bounds)
+        train_metrics = evaluate_model(y_train_log, y_train_pred, 'Training', y_train_log)
+        val_metrics = evaluate_model(y_val_log, y_val_pred, 'Validation', y_train_log)
 
         results[model_name] = {
             'train': train_metrics,
@@ -401,7 +431,7 @@ def main():
 
     # Select best model
     best_model_name = max(results, key=lambda x: results[x]['val']['r2'])
-    print(f"\n🏆 Best Model: {best_model_name} (R² = {results[best_model_name]['val']['r2']:.4f})")
+    print(f"\nBest Model: {best_model_name} (R2 = {results[best_model_name]['val']['r2']:.4f})")
 
     # Final test set evaluation
     print("\n" + "="*70)
@@ -411,7 +441,16 @@ def main():
     best_model, best_preprocessor = trained_models[best_model_name]
     X_test_processed = best_preprocessor.transform(X_test)
     y_test_pred_log = best_model.predict(X_test_processed)
-    y_test_pred = np.exp(y_test_pred_log) - 1  # Reverse transformation
+
+    # Clip predictions to reasonable bounds (based on training data range)
+    # Log training mean ± 3 std to allow for reasonable variation
+    log_mean = y_train_log.mean()
+    log_std = y_train_log.std()
+    min_bound = log_mean - 3 * log_std
+    max_bound = log_mean + 3 * log_std
+    y_test_pred_log = np.clip(y_test_pred_log, min_bound, max_bound)
+
+    y_test_pred = np.expm1(y_test_pred_log)  # Reverse transformation
 
     print(f"\nTest predictions summary:")
     print(f"  Mean predicted duration: {y_test_pred.mean():.2f} seconds ({y_test_pred.mean()/60:.2f} minutes)")
@@ -419,7 +458,7 @@ def main():
     print(f"  Min: {y_test_pred.min():.2f}s, Max: {y_test_pred.max():.2f}s")
 
     print("\n" + "="*70)
-    print("PIPELINE COMPLETE ✓")
+    print("PIPELINE COMPLETE")
     print("="*70)
 
     return results, trained_models, best_model_name, y_test_pred
