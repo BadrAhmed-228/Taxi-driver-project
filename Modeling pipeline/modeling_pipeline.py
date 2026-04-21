@@ -6,7 +6,7 @@ Key Design Decisions:
 1. Log transform target (right-skewed, 5.09% outliers with extreme values)
 2. RobustScaler for distance (skewed + outliers)
 3. StandardScaler for coordinates
-4. Tree-based models (weak linear correlations - 0.121 max)
+4. Ridge regression with alpha=1
 5. Feature engineering: hour, day_of_week, is_rush_hour, distance
 6. Proper train/validation split with fit-only-on-train strategy
 """
@@ -16,19 +16,17 @@ import numpy as np
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+import joblib
+import os
 
-from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import (
     StandardScaler, RobustScaler, OneHotEncoder, OrdinalEncoder,
-    FunctionTransformer
+    FunctionTransformer, PolynomialFeatures, PowerTransformer, QuantileTransformer
 )
 from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-import xgboost as xgb
 
 # ============================================================================
 # 1. LOAD DATA
@@ -123,6 +121,23 @@ def engineer_features(df, fit_on_train=False):
     df.loc[df['passenger_count'] == 0, 'passenger_group'] = 1  # Treat as single
     df.loc[df['passenger_count'] >= 5, 'passenger_group'] = 5  # Group large groups
 
+    # Feature interactions (Idea 2)
+    df['distance_hour_interaction'] = df['distance_km'] * df['hour']
+    df['distance_rush_interaction'] = df['distance_km'] * df['is_rush_hour']
+    df['lat_lon_distance'] = df['pickup_latitude'] * df['pickup_longitude']
+
+    # Cyclic time features (Idea 3)
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+
+    # Distance-based features (Idea 3)
+    df['distance_log'] = np.log1p(df['distance_km'])
+    df['distance_category'] = pd.cut(df['distance_km'],
+        bins=[0, 1, 3, 5, 10, 20, 50, float('inf')],
+        labels=['very_short', 'short', 'medium', 'long', 'very_long', 'extreme', 'outlier'])
+
     return df
 
 
@@ -139,15 +154,25 @@ def create_preprocessing_pipeline():
     - Numerical: RobustScaler for skewed features (distance)
     - Categorical: OneHotEncoder for high-cardinality
     - OrdinalEncoder for binary/ordinal features
+    - Polynomial: Degree 2 for selected features to capture non-linear relationships
     """
 
-    # Numerical features
-    # EDA: Distance is right-skewed (std 4.42 km) with outliers
+    # Numerical features - Advanced preprocessing (Idea 2)
     numerical_features = ['distance_km', 'pickup_longitude', 'pickup_latitude',
-                         'dropoff_longitude', 'dropoff_latitude']
+                         'dropoff_longitude', 'dropoff_latitude', 'distance_log']
 
     numerical_transformer = Pipeline(steps=[
-        ('robust_scaler', RobustScaler())  # Handles outliers better than StandardScaler
+        ('power', PowerTransformer(method='yeo-johnson')),  # Better for skewed data
+        ('scaler', StandardScaler())
+    ])
+
+    # Polynomial features (Idea 1) - degree 2 for key continuous features
+    polynomial_features = ['distance_km', 'pickup_latitude', 'pickup_longitude',
+                          'distance_hour_interaction', 'distance_rush_interaction']
+
+    polynomial_transformer = Pipeline(steps=[
+        ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+        ('scaler', StandardScaler())
     ])
 
     # Categorical features
@@ -173,12 +198,13 @@ def create_preprocessing_pipeline():
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', numerical_transformer, numerical_features),
+            ('poly', polynomial_transformer, polynomial_features),
             ('cat', categorical_transformer, categorical_features),
             ('onehot', onehot_transformer, onehot_features)
         ]
     )
 
-    return preprocessor, numerical_features, categorical_features, onehot_features
+    return preprocessor, numerical_features, polynomial_features, categorical_features, onehot_features
 
 
 # ============================================================================
@@ -187,43 +213,13 @@ def create_preprocessing_pipeline():
 
 def create_models():
     """
-    Create models based on EDA findings.
-
-    EDA Insight: Weak linear correlations (max 0.121) suggest tree-based
-    models are more appropriate than linear regression. Including both linear
-    and tree-based approaches for comparison.
+    Create Ridge model with alpha=1 based on requirements.
     """
 
     models = {
         'Ridge': Ridge(
             alpha=1.0,
             random_state=42
-        ),
-        'RandomForest': RandomForestRegressor(
-            n_estimators=10,
-            max_depth=10,
-            min_samples_split=100,
-            min_samples_leaf=50,
-            random_state=42,
-            n_jobs=-1
-        ),
-        'GradientBoosting': GradientBoostingRegressor(
-            n_estimators=15,
-            learning_rate=0.1,
-            max_depth=4,
-            min_samples_split=100,
-            min_samples_leaf=50,
-            random_state=42,
-            subsample=0.5
-        ),
-        'XGBoost': xgb.XGBRegressor(
-            n_estimators=15,
-            learning_rate=0.1,
-            max_depth=4,
-            min_child_weight=50,
-            random_state=42,
-            n_jobs=-1,
-            tree_method='hist'
         )
     }
 
@@ -332,8 +328,249 @@ def evaluate_model(y_true, y_pred, split_name='Validation', y_train_log=None):
 
 
 # ============================================================================
-# 7. MAIN PIPELINE EXECUTION
+# 7. MODEL PERSISTENCE (SAVE/LOAD)
 # ============================================================================
+
+def save_model_artifacts(model, preprocessor, model_name, results, save_dir=None):
+    """
+    Save trained model, preprocessor, and results metadata to .pkl files.
+    
+    Parameters:
+    -----------
+    model : sklearn model
+        Trained model object
+    preprocessor : ColumnTransformer
+        Fitted preprocessing pipeline
+    model_name : str
+        Name of the model (e.g., 'Ridge')
+    results : dict
+        Model performance results/metrics
+    save_dir : str, optional
+        Directory to save files. If None, uses current directory
+    """
+    
+    if save_dir is None:
+        save_dir = os.getcwd()
+    
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"\n{'='*70}")
+    print("SAVING MODEL ARTIFACTS")
+    print(f"{'='*70}")
+    
+    # Save model
+    model_path = os.path.join(save_dir, f'{model_name}_model.pkl')
+    joblib.dump(model, model_path)
+    print(f"✓ Model saved: {model_path}")
+    
+    # Save preprocessor
+    preprocessor_path = os.path.join(save_dir, f'{model_name}_preprocessor.pkl')
+    joblib.dump(preprocessor, preprocessor_path)
+    print(f"✓ Preprocessor saved: {preprocessor_path}")
+    
+    # Save results/metrics
+    results_path = os.path.join(save_dir, f'{model_name}_results.pkl')
+    joblib.dump(results, results_path)
+    print(f"✓ Results saved: {results_path}")
+    
+    print(f"\nAll artifacts saved successfully to: {save_dir}")
+    return model_path, preprocessor_path, results_path
+
+
+def load_model_artifacts(model_name, load_dir=None):
+    """
+    Load trained model, preprocessor, and results from .pkl files.
+    
+    Parameters:
+    -----------
+    model_name : str
+        Name of the model (e.g., 'Ridge')
+    load_dir : str, optional
+        Directory containing saved files. If None, uses current directory
+    
+    Returns:
+    --------
+    model : sklearn model
+        Trained model
+    preprocessor : ColumnTransformer
+        Fitted preprocessor
+    results : dict
+        Performance metrics
+    """
+    
+    if load_dir is None:
+        load_dir = os.getcwd()
+    
+    model_path = os.path.join(load_dir, f'{model_name}_model.pkl')
+    preprocessor_path = os.path.join(load_dir, f'{model_name}_preprocessor.pkl')
+    results_path = os.path.join(load_dir, f'{model_name}_results.pkl')
+    
+    print(f"Loading model artifacts from: {load_dir}")
+    
+    model = joblib.load(model_path)
+    print(f"✓ Model loaded: {model_path}")
+    
+    preprocessor = joblib.load(preprocessor_path)
+    print(f"✓ Preprocessor loaded: {preprocessor_path}")
+    
+    results = joblib.load(results_path)
+    print(f"✓ Results loaded: {results_path}")
+    
+    return model, preprocessor, results
+
+
+# ============================================================================
+# 8. PRODUCTION DEPLOYMENT WRAPPER
+# ============================================================================
+
+class TaxiDurationPredictor:
+    """
+    Production-ready wrapper for end-to-end taxi duration prediction.
+    
+    Handles:
+    - Raw user input (pickup_datetime, lat/lon, etc.)
+    - Feature engineering (all transformations)
+    - Preprocessing (scaling, encoding)
+    - Model prediction
+    - Output interpretation (seconds to minutes/hours)
+    
+    Usage:
+    ------
+    # Load model
+    predictor = TaxiDurationPredictor()
+    predictor.load_model('Ridge', model_dir)
+    
+    # Make predictions on raw data
+    raw_data = pd.DataFrame({
+        'pickup_datetime': ['2016-03-15 10:30:00'],
+        'pickup_latitude': [40.7580],
+        'pickup_longitude': [-73.9855],
+        'dropoff_latitude': [40.7489],
+        'dropoff_longitude': [-73.9680],
+        'passenger_count': [1],
+        'vendor_id': [2],
+        'store_and_fwd_flag': ['N']
+    })
+    
+    predictions = predictor.predict(raw_data)
+    print(predictions)
+    """
+    
+    def __init__(self):
+        self.model = None
+        self.preprocessor = None
+        self.feature_cols = [
+            'vendor_id', 'pickup_longitude', 'pickup_latitude',
+            'dropoff_longitude', 'dropoff_latitude', 'passenger_count',
+            'store_and_fwd_flag', 'hour', 'day_of_week', 'distance_km',
+            'is_rush_hour', 'is_weekday', 'is_zero_distance', 'passenger_group',
+            'distance_hour_interaction', 'distance_rush_interaction', 'lat_lon_distance',
+            'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'distance_log', 'distance_category'
+        ]
+        self.is_loaded = False
+    
+    def load_model(self, model_name='Ridge', model_dir=None):
+        """Load saved model and preprocessor."""
+        self.model, self.preprocessor, self.results = load_model_artifacts(model_name, model_dir)
+        self.is_loaded = True
+        print(f"✓ TaxiDurationPredictor ready for deployment")
+    
+    def _engineer_features(self, df):
+        """Apply feature engineering (same as training)."""
+        return engineer_features(df)
+    
+    def predict(self, raw_data):
+        """
+        Make predictions on raw user input.
+        
+        Parameters:
+        -----------
+        raw_data : pd.DataFrame
+            Must contain columns: 
+            - pickup_datetime (str or datetime)
+            - pickup_latitude, pickup_longitude
+            - dropoff_latitude, dropoff_longitude
+            - passenger_count (int)
+            - vendor_id (int: 1 or 2)
+            - store_and_fwd_flag (str: 'Y' or 'N')
+        
+        Returns:
+        --------
+        dict with predictions
+        """
+        
+        if not self.is_loaded:
+            raise ValueError("Model not loaded! Call load_model() first.")
+        
+        # Validate input
+        required_cols = ['pickup_datetime', 'pickup_latitude', 'pickup_longitude',
+                        'dropoff_latitude', 'dropoff_longitude', 'passenger_count',
+                        'vendor_id', 'store_and_fwd_flag']
+        
+        missing = [col for col in required_cols if col not in raw_data.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+        
+        # Feature engineering
+        engineered_data = self._engineer_features(raw_data.copy())
+        
+        # Extract features
+        X = engineered_data[self.feature_cols].copy()
+        
+        # Preprocess
+        X_processed = self.preprocessor.transform(X)
+        
+        # Predict (in log space)
+        y_pred_log = self.model.predict(X_processed)
+        
+        # Reverse log transformation
+        y_pred_seconds = np.expm1(y_pred_log)
+        
+        # Clip to reasonable range (prevent outliers)
+        y_pred_seconds = np.clip(y_pred_seconds, 60, 3600*2)  # 1 min to 2 hours
+        
+        # Create output
+        results = pd.DataFrame({
+            'predicted_duration_seconds': y_pred_seconds.astype(int),
+            'predicted_duration_minutes': (y_pred_seconds / 60).astype(int),
+            'predicted_duration_hours_minutes': [
+                f"{int(sec//3600)}h {int((sec%3600)//60)}m"
+                for sec in y_pred_seconds
+            ]
+        })
+        
+        # Add input features for transparency
+        results['pickup_datetime'] = raw_data['pickup_datetime'].values
+        results['passenger_count'] = raw_data['passenger_count'].values
+        results['distance_km'] = engineered_data['distance_km'].values.round(2)
+        
+        return results
+    
+    def predict_single(self, pickup_dt, pickup_lat, pickup_lon, 
+                       dropoff_lat, dropoff_lon, passenger_count, 
+                       vendor_id, store_and_fwd_flag='N'):
+        """
+        Convenience method for single prediction.
+        
+        Returns: dict with prediction
+        """
+        data = pd.DataFrame({
+            'pickup_datetime': [pickup_dt],
+            'pickup_latitude': [pickup_lat],
+            'pickup_longitude': [pickup_lon],
+            'dropoff_latitude': [dropoff_lat],
+            'dropoff_longitude': [dropoff_lon],
+            'passenger_count': [passenger_count],
+            'vendor_id': [vendor_id],
+            'store_and_fwd_flag': [store_and_fwd_flag]
+        })
+        
+        result = self.predict(data)
+        return result.iloc[0].to_dict()
+
+
+
 
 def main():
     """Execute complete modeling pipeline."""
@@ -352,13 +589,18 @@ def main():
 
     print(f"Engineered features added. Train shape: {train_engineered.shape}")
     print(f"New columns: hour, day_of_week, month, is_rush_hour, is_weekday, distance_km, is_zero_distance, passenger_group")
+    print(f"Interaction features: distance_hour_interaction, distance_rush_interaction, lat_lon_distance")
+    print(f"Cyclic time features: hour_sin, hour_cos, day_sin, day_cos")
+    print(f"Distance features: distance_log, distance_category")
 
     # Separate features and target
     feature_cols = [
         'vendor_id', 'pickup_longitude', 'pickup_latitude',
         'dropoff_longitude', 'dropoff_latitude', 'passenger_count',
         'store_and_fwd_flag', 'hour', 'day_of_week', 'distance_km',
-        'is_rush_hour', 'is_weekday', 'is_zero_distance', 'passenger_group'
+        'is_rush_hour', 'is_weekday', 'is_zero_distance', 'passenger_group',
+        'distance_hour_interaction', 'distance_rush_interaction', 'lat_lon_distance',
+        'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'distance_log', 'distance_category'
     ]
 
     X_train = train_engineered[feature_cols].copy()
@@ -368,11 +610,13 @@ def main():
     y_val = val_engineered['trip_duration'].copy()
 
     X_test = test_engineered[feature_cols].copy()
+    y_test = test_engineered['trip_duration'].copy()
 
     # Log transform target (EDA: highly right-skewed, 5.09% outliers)
     print("\nApplying log transformation to target variable...")
     y_train_log = np.log1p(y_train)  # log1p = log(1 + x) handles zeros
     y_val_log = np.log1p(y_val)
+    y_test_log = np.log1p(y_test)
 
     print(f"Original target - mean: {y_train.mean():.2f}s, std: {y_train.std():.2f}s")
     print(f"Log target - mean: {y_train_log.mean():.4f}, std: {y_train_log.std():.4f}")
@@ -382,8 +626,9 @@ def main():
     print("CREATING PREPROCESSING PIPELINE")
     print("="*70)
 
-    preprocessor, num_features, cat_features, onehot_features = create_preprocessing_pipeline()
+    preprocessor, num_features, poly_features, cat_features, onehot_features = create_preprocessing_pipeline()
     print(f"Numerical features ({len(num_features)}): {num_features}")
+    print(f"Polynomial features ({len(poly_features)}): {poly_features}")
     print(f"Categorical/Binary features ({len(cat_features)}): {cat_features}")
     print(f"One-hot features ({len(onehot_features)}): {onehot_features}")
 
@@ -396,7 +641,7 @@ def main():
 
     for model_name, model in models.items():
         # Create new preprocessor for each model (fresh fit)
-        preprocessor_copy, _, _, _ = create_preprocessing_pipeline()
+        preprocessor_copy, _, _, _, _ = create_preprocessing_pipeline()
 
         model_fitted, prep_fitted, y_train_pred, y_val_pred = train_model(
             X_train, y_train_log, X_val, y_val_log,
@@ -450,12 +695,25 @@ def main():
     max_bound = log_mean + 3 * log_std
     y_test_pred_log = np.clip(y_test_pred_log, min_bound, max_bound)
 
+    # Evaluate on test set
+    test_metrics = evaluate_model(y_test_log, y_test_pred_log, 'Test', y_train_log)
+
     y_test_pred = np.expm1(y_test_pred_log)  # Reverse transformation
 
     print(f"\nTest predictions summary:")
     print(f"  Mean predicted duration: {y_test_pred.mean():.2f} seconds ({y_test_pred.mean()/60:.2f} minutes)")
     print(f"  Std predicted duration: {y_test_pred.std():.2f} seconds")
     print(f"  Min: {y_test_pred.min():.2f}s, Max: {y_test_pred.max():.2f}s")
+
+    # Save model artifacts
+    model_save_dir = os.path.dirname(os.path.abspath(__file__))
+    save_model_artifacts(
+        best_model, 
+        best_preprocessor, 
+        best_model_name,
+        results[best_model_name],
+        save_dir=model_save_dir
+    )
 
     print("\n" + "="*70)
     print("PIPELINE COMPLETE")
